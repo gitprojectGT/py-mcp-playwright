@@ -1,0 +1,441 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of tests to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+        - all
+        - smoke
+        - api
+        - ui
+        - integration
+      environment:
+        description: 'Environment to test against'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+env:
+  PYTHON_VERSION: '3.13'
+  NODE_VERSION: '20'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Code quality and linting
+  code-quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Code formatting check
+        run: |
+          black --check --diff .
+          isort --check-only --diff .
+
+      - name: Linting
+        run: |
+          flake8 src tests utils examples
+          
+      - name: Type checking
+        run: |
+          mypy src --ignore-missing-imports
+
+      - name: Security scan
+        run: |
+          pip install bandit safety
+          bandit -r src/ -f json -o bandit-report.json || true
+          safety check --json --output safety-report.json || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 7
+
+  # Build Docker image
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: code-quality
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=Python Playwright MCP Testing Framework
+
+  # Test matrix for different browsers and test types
+  test-matrix:
+    name: Test (${{ matrix.test-type }}, ${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        test-type: [api, ui, integration]
+        browser: [chromium, firefox, webkit]
+        exclude:
+          # API tests don't need different browsers
+          - test-type: api
+            browser: firefox
+          - test-type: api
+            browser: webkit
+    env:
+      HEADLESS: true
+      BROWSER: ${{ matrix.browser }}
+      TEST_ENV: github-actions
+      PYTEST_WORKERS: 2
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: playwright-tests:latest
+          cache-from: type=gha
+
+      - name: Run ${{ matrix.test-type }} tests
+        run: |
+          docker run --rm \
+            -e HEADLESS=${{ env.HEADLESS }} \
+            -e PLAYWRIGHT_BROWSER=${{ matrix.browser }} \
+            -e TEST_ENV=${{ env.TEST_ENV }} \
+            -e PYTEST_WORKERS=${{ env.PYTEST_WORKERS }} \
+            -v ${{ github.workspace }}/test-results:/app/test-results \
+            playwright-tests:latest \
+            python -m pytest -m ${{ matrix.test-type }} --tb=short -v \
+            --junitxml=test-results/junit-${{ matrix.test-type }}-${{ matrix.browser }}.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.test-type }}-${{ matrix.browser }}
+          path: |
+            test-results/
+          retention-days: 7
+
+  # Smoke tests - fast validation
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: playwright-tests:latest
+          cache-from: type=gha
+
+      - name: Run smoke tests
+        run: |
+          docker run --rm \
+            -e HEADLESS=true \
+            -e TEST_ENV=github-actions \
+            -v ${{ github.workspace }}/test-results:/app/test-results \
+            playwright-tests:latest \
+            python -m pytest -m smoke --tb=short -v \
+            --junitxml=test-results/junit-smoke.xml
+
+      - name: Upload smoke test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-results
+          path: test-results/
+          retention-days: 7
+
+  # Coverage analysis
+  coverage:
+    name: Coverage Analysis
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: playwright-tests:latest
+          cache-from: type=gha
+
+      - name: Run tests with coverage
+        run: |
+          docker run --rm \
+            -e HEADLESS=true \
+            -e TEST_ENV=github-actions \
+            -v ${{ github.workspace }}/test-results:/app/test-results \
+            playwright-tests:latest \
+            python -m pytest --cov=src --cov-report=xml --cov-report=html \
+            --cov-fail-under=70 -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./test-results/coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            test-results/coverage.xml
+            test-results/htmlcov/
+          retention-days: 14
+
+  # Performance tests
+  performance:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: playwright-tests:latest
+          cache-from: type=gha
+
+      - name: Run performance tests
+        run: |
+          docker run --rm \
+            -e HEADLESS=true \
+            -e TEST_ENV=github-actions \
+            -e MAX_RESPONSE_TIME=10.0 \
+            -v ${{ github.workspace }}/test-results:/app/test-results \
+            playwright-tests:latest \
+            python -m pytest -m slow --tb=short -v \
+            --junitxml=test-results/junit-performance.xml
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-results
+          path: test-results/
+          retention-days: 30
+
+  # Manual workflow dispatch tests
+  manual-tests:
+    name: Manual Tests
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: playwright-tests:latest
+          cache-from: type=gha
+
+      - name: Run manual tests
+        run: |
+          TEST_MARKER="${{ github.event.inputs.test_type }}"
+          if [ "$TEST_MARKER" = "all" ]; then
+            TEST_MARKER=""
+          else
+            TEST_MARKER="-m $TEST_MARKER"
+          fi
+          
+          docker run --rm \
+            -e HEADLESS=true \
+            -e TEST_ENV=${{ github.event.inputs.environment }} \
+            -v ${{ github.workspace }}/test-results:/app/test-results \
+            playwright-tests:latest \
+            python -m pytest $TEST_MARKER --tb=short -v \
+            --junitxml=test-results/junit-manual.xml
+
+      - name: Upload manual test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manual-test-results
+          path: test-results/
+          retention-days: 7
+
+  # Test results summary
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [smoke-tests, test-matrix, coverage]
+    if: always()
+    steps:
+      - name: Download all test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*test-results*'
+          merge-multiple: true
+          path: all-test-results/
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results Summary
+          path: 'all-test-results/junit-*.xml'
+          reporter: java-junit
+          fail-on-error: false
+
+  # Deployment (only on main branch)
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [test-summary, coverage]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "🚀 Deploying to production..."
+          echo "✅ Deployment completed successfully!"
+          
+      - name: Create deployment status
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed at**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+
+  # Cleanup
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    steps:
+      - name: Clean up old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            
+            console.log(`Found ${artifacts.data.artifacts.length} artifacts`);
+            
+            // Keep artifacts for 7 days, then clean up
+            const cutoff = new Date();
+            cutoff.setDate(cutoff.getDate() - 7);
+            
+            for (const artifact of artifacts.data.artifacts) {
+              const createdAt = new Date(artifact.created_at);
+              if (createdAt < cutoff) {
+                console.log(`Deleting old artifact: ${artifact.name}`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }

@@ -1,0 +1,89 @@
+# GitLeaks configuration for secret detection
+
+[extend]
+# Extend default rules
+useDefault = true
+
+[[rules]]
+description = "API Keys"
+id = "api-key"
+regex = '''(?i)(api[_-]?key|apikey)[=:\s]*['"]?([a-zA-Z0-9]{20,})['"]?'''
+tags = ["key", "API"]
+
+[[rules]]
+description = "Database URLs"
+id = "database-url"
+regex = '''(?i)(database[_-]?url|db[_-]?url)[=:\s]*['"]?(.*://[^'"\s]+)['"]?'''
+tags = ["database", "url"]
+
+[[rules]]
+description = "Private Keys"
+id = "private-key"
+regex = '''-----BEGIN (RSA |EC |DSA |PGP )?PRIVATE KEY-----'''
+tags = ["key", "private"]
+
+[[rules]]
+description = "Generic Passwords"
+id = "generic-password"
+regex = '''(?i)(password|passwd|pwd)[=:\s]*['"]?([^'"\s]{8,})['"]?'''
+tags = ["password"]
+
+[[rules]]
+description = "JWT Tokens"
+id = "jwt-token"
+regex = '''eyJ[A-Za-z0-9_/+-]*\.eyJ[A-Za-z0-9_/+-]*\.[A-Za-z0-9_/+-]*'''
+tags = ["jwt", "token"]
+
+[[rules]]
+description = "GitHub Tokens"
+id = "github-token"
+regex = '''gh[pousr]_[A-Za-z0-9_]{36,}'''
+tags = ["github", "token"]
+
+[[rules]]
+description = "Slack Tokens"
+id = "slack-token"
+regex = '''xox[baprs]-[A-Za-z0-9-]{10,72}'''
+tags = ["slack", "token"]
+
+[[rules]]
+description = "AWS Access Keys"
+id = "aws-access-key"
+regex = '''AKIA[0-9A-Z]{16}'''
+tags = ["aws", "access-key"]
+
+[[rules]]
+description = "AWS Secret Keys"
+id = "aws-secret-key"
+regex = '''[A-Za-z0-9/+=]{40}'''
+tags = ["aws", "secret-key"]
+
+[allowlist]
+description = "Allow test files and examples"
+files = [
+    '''(?i).*test.*''',
+    '''(?i).*example.*''',
+    '''(?i).*sample.*''',
+    '''(?i).*mock.*''',
+    '''(?i).*dummy.*''',
+]
+
+[allowlist]
+description = "Allow documentation files"
+paths = [
+    '''.*\.md$''',
+    '''.*\.rst$''',
+    '''.*\.txt$''',
+    '''docs/.*''',
+]
+
+[allowlist]
+description = "Allow common false positives"
+regexes = [
+    '''fake[_-]?(password|key|token)''',
+    '''test[_-]?(password|key|token)''',
+    '''example[_-]?(password|key|token)''',
+    '''dummy[_-]?(password|key|token)''',
+    '''placeholder[_-]?(password|key|token)''',
+    '''your[_-]?(password|key|token)''',
+]
