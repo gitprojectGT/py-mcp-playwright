@@ -1,4 +1,4 @@
-# Python Playwright MCP Testing Framework
+# Python Playwright MCP Testing Framework 
 
 A comprehensive Python testing framework using Playwright with Model Context Protocol (MCP) integration for automated web application and API testing.
 
